@@ -10,7 +10,7 @@ from queue import Queue, Empty
 import statistics
 import json
 
-logging_interval = 30.0
+logging_interval = 20.0
 
 try:
     from BH1750_test import BH1750, parse_args as original_parse_args
@@ -19,11 +19,10 @@ except ImportError:
     sys.exit(1)
 
 class CSVLightLogger:
-    def __init__(self, filename=None, interval=logging_interval, bus=1, addr=0x23, buffer_size=100, include_stats=True, auto_backup=False):
-        self.interval = interval
+    def __init__(self, filename=None, interval=None, bus=1, addr=0x23, buffer_size=100, include_stats=True):
+        self.interval = logging_interval if interval is None else interval
         self.buffer_size = buffer_size
         self.include_stats = include_stats
-        self.auto_backup = auto_backup
         self.running = False
         self.data_queue = Queue()
         self.stats_buffer = []
@@ -33,9 +32,8 @@ class CSVLightLogger:
             print(f"Failed to initialize BH1750 sensor: {e}", file=sys.stderr)
             sys.exit(2)
         if filename is None:
-            filename = f"light_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            filename = f"light_data_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
         self.csv_path = Path(filename)
-        self.backup_path = self.csv_path.with_suffix('.backup.csv')
         self._initialize_csv()
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -72,13 +70,14 @@ class CSVLightLogger:
     def _read_sensor_continuous(self):
         consecutive_errors = 0
         max_errors = 5
+        sleep_between_reads = max(0.2, self.interval / 5.0)
         while self.running:
             try:
                 lux = self.sensor.read_lux()
                 timestamp = time.time()
                 self.data_queue.put((timestamp, lux))
                 consecutive_errors = 0
-                time.sleep(0.1)
+                time.sleep(sleep_between_reads)
             except Exception as e:
                 consecutive_errors += 1
                 print(f"Sensor read error ({consecutive_errors}/{max_errors}): {e}", file=sys.stderr)
@@ -89,23 +88,23 @@ class CSVLightLogger:
     
     def _process_and_log_data(self):
         last_log_time = time.time()
-        minute_samples = []
+        buffer_samples = []
         while self.running:
             try:
                 current_time = time.time()
                 while True:
                     try:
                         timestamp, lux = self.data_queue.get_nowait()
-                        minute_samples.append((timestamp, lux))
+                        buffer_samples.append((timestamp, lux))
                     except Empty:
                         break
                 if current_time - last_log_time >= self.interval:
-                    if minute_samples:
-                        latest_timestamp, latest_lux = minute_samples[-1]
+                    if buffer_samples:
+                        latest_timestamp, latest_lux = buffer_samples[-1]
                         dt = datetime.fromtimestamp(latest_timestamp, tz=timezone.utc)
                         row_data = [int(latest_timestamp), dt.isoformat(), round(latest_lux, 2)]
-                        if self.include_stats and len(minute_samples) > 0:
-                            lux_values = [lux for _, lux in minute_samples]
+                        if self.include_stats:
+                            lux_values = [lux for _, lux in buffer_samples]
                             min_lux, max_lux, avg_lux, std_lux = self._calculate_stats(lux_values)
                             row_data.extend([
                                 round(min_lux, 2) if min_lux is not None else None,
@@ -117,13 +116,12 @@ class CSVLightLogger:
                             writer = csv.writer(csvfile)
                             writer.writerow(row_data)
                         print(f"{dt.strftime('%Y-%m-%d %H:%M:%S')} - {latest_lux:.2f} lx "
-                              f"(samples: {len(minute_samples)})")
-                        minute_samples.clear()
-                        last_log_time = current_time
+                              f"(samples: {len(buffer_samples)})")
+                        buffer_samples.clear()
                     else:
                         print(f"No samples collected in the last {self.interval} seconds")
-                        last_log_time = current_time
-                time.sleep(1.0)
+                    last_log_time = current_time
+                time.sleep(0.5)
             except Exception as e:
                 print(f"Data processing error: {e}", file=sys.stderr)
                 time.sleep(5.0)
@@ -150,8 +148,6 @@ class CSVLightLogger:
             return
         print("Stopping logger...")
         self.running = False
-        if self.auto_backup:
-            self._backup_data()
         if self.csv_path.exists():
             try:
                 with open(self.csv_path, 'r') as f:
@@ -161,26 +157,21 @@ class CSVLightLogger:
                         print(f"Total records logged: {len(rows) - 1}")
             except Exception:
                 pass
-        
         print("Logger stopped.")
 
 def parse_csv_args():
     parser = argparse.ArgumentParser(
-        description="Log BH1750 light sensor data to CSV file every minute",
+        description="Log BH1750 light sensor data to CSV file",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                          #Log every minute to auto-named file
+  %(prog)s                          #Log using logging_interval from top of script
   %(prog)s -f light_data.csv        #Log to specific file
-  %(prog)s -i 30                    #Log every 30 seconds
   %(prog)s --no-stats               #Disable statistical analysis
   %(prog)s --addr 0x5c --bus 0      #Use different I2C address/bus
         """)
-    
-    parser.add_argument('-f', '--filename', type=str, 
+    parser.add_argument('-f', '--filename', type=str,
                        help='CSV filename (default: auto-generated with timestamp)')
-    parser.add_argument('-i', '--interval', type=float, default=60.0,
-                       help='Logging interval in seconds (default: 60)')
     parser.add_argument('--addr', type=lambda x: int(x,0), default=0x23,
                        help='I2C address (default: 0x23)')
     parser.add_argument('--bus', type=int, default=1,
@@ -189,9 +180,6 @@ Examples:
                        help='Internal buffer size (default: 100)')
     parser.add_argument('--no-stats', action='store_true',
                        help='Disable statistical analysis')
-    parser.add_argument('--no-backup', action='store_true',
-                       help='Disable automatic backup creation')
-    
     return parser.parse_args()
 
 def main():
@@ -199,12 +187,11 @@ def main():
     try:
         logger = CSVLightLogger(
             filename=args.filename,
-            interval=args.interval,
+            interval=logging_interval,
             bus=args.bus,
             addr=args.addr,
             buffer_size=args.buffer_size,
-            include_stats=not args.no_stats,
-            auto_backup=not args.no_backup
+            include_stats=not args.no_stats
         )
         logger.start()
     except KeyboardInterrupt:
