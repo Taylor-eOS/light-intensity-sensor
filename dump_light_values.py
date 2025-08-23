@@ -24,20 +24,22 @@ class CSVLightLogger:
         self.buffer_size = buffer_size
         self.include_stats = include_stats
         self.running = False
-        self.data_queue = Queue()
-        self.stats_buffer = []
         try:
             self.sensor = BH1750(bus=bus, addr=addr)
         except Exception as e:
             print(f"Failed to initialize BH1750 sensor: {e}", file=sys.stderr)
             sys.exit(2)
         if filename is None:
-            filename = f"light_data_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+            #filename = f"light_data_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+            filename = f"light_data.csv"
         self.csv_path = Path(filename)
+        self.readings_per_interval = max(1, min(5, int(self.interval / 10) + 1))
+        self.sample_delay = 0.1
+        self.max_consecutive_errors = 5
         self._initialize_csv()
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
-    
+
     def _initialize_csv(self):
         headers = ['timestamp', 'iso_timestamp', 'lux_value']
         if self.include_stats:
@@ -47,102 +49,81 @@ class CSVLightLogger:
             writer.writerow(headers)
         print(f"CSV logging initialized: {self.csv_path}")
         if self.include_stats:
-            print("Statistical analysis enabled (1-minute window)")
-    
+            print("Statistical analysis enabled (trimmed/median style)")
+
     def _signal_handler(self, signum, frame):
         print(f"\nReceived signal {signum}, shutting down gracefully...")
         self.stop()
-    
-    def _backup_data(self):
-        if self.auto_backup and self.csv_path.exists():
-            try:
-                import shutil
-                shutil.copy2(self.csv_path, self.backup_path)
-                print(f"Backup created: {self.backup_path}")
-            except Exception as e:
-                print(f"Backup failed: {e}", file=sys.stderr)
-    
+
     def _calculate_stats(self, values):
         if not values:
             return None, None, None, None
-        return (min(values), max(values), statistics.mean(values), statistics.stdev(values) if len(values) > 1 else 0.0)
-    
-    def _read_sensor_continuous(self):
+        mean = statistics.mean(values)
+        stdev = statistics.stdev(values) if len(values) > 1 else 0.0
+        return min(values), max(values), mean, stdev
+
+    def _aggregate_readings(self, readings):
+        if not readings:
+            return None
+        if len(readings) == 1:
+            return readings[0]
+        sorted_r = sorted(readings)
+        if len(sorted_r) <= 2:
+            return statistics.mean(sorted_r)
+        trimmed = sorted_r[1:-1]
+        return statistics.mean(trimmed)
+
+    def _read_and_log_loop(self):
         consecutive_errors = 0
-        max_errors = 5
-        sleep_between_reads = max(0.2, self.interval / 5.0)
+        next_time = time.time()
         while self.running:
             try:
-                lux = self.sensor.read_lux()
-                timestamp = time.time()
-                self.data_queue.put((timestamp, lux))
-                consecutive_errors = 0
-                time.sleep(sleep_between_reads)
-            except Exception as e:
-                consecutive_errors += 1
-                print(f"Sensor read error ({consecutive_errors}/{max_errors}): {e}", file=sys.stderr)
-                if consecutive_errors >= max_errors:
-                    print("Too many consecutive errors, stopping sensor thread", file=sys.stderr)
-                    break
-                time.sleep(1.0)
-    
-    def _process_and_log_data(self):
-        last_log_time = time.time()
-        buffer_samples = []
-        while self.running:
-            try:
-                current_time = time.time()
-                while True:
-                    try:
-                        timestamp, lux = self.data_queue.get_nowait()
-                        buffer_samples.append((timestamp, lux))
-                    except Empty:
+                try:
+                    lux = self.sensor.read_lux()
+                    consecutive_errors = 0
+                except Exception as e:
+                    consecutive_errors += 1
+                    print(f"Sensor read error ({consecutive_errors}/{self.max_consecutive_errors}): {e}", file=sys.stderr)
+                    if consecutive_errors >= self.max_consecutive_errors:
+                        print("Too many consecutive errors, stopping logger", file=sys.stderr)
+                        self.running = False
                         break
-                if current_time - last_log_time >= self.interval:
-                    if buffer_samples:
-                        latest_timestamp, latest_lux = buffer_samples[-1]
-                        dt = datetime.fromtimestamp(latest_timestamp, tz=timezone.utc)
-                        row_data = [int(latest_timestamp), dt.isoformat(), round(latest_lux, 2)]
-                        if self.include_stats:
-                            lux_values = [lux for _, lux in buffer_samples]
-                            min_lux, max_lux, avg_lux, std_lux = self._calculate_stats(lux_values)
-                            row_data.extend([
-                                round(min_lux, 2) if min_lux is not None else None,
-                                round(max_lux, 2) if max_lux is not None else None,
-                                round(avg_lux, 2) if avg_lux is not None else None,
-                                round(std_lux, 2) if std_lux is not None else None,
-                                len(lux_values)])
-                        with open(self.csv_path, 'a', newline='') as csvfile:
-                            writer = csv.writer(csvfile)
-                            writer.writerow(row_data)
-                        print(f"{dt.strftime('%Y-%m-%d %H:%M:%S')} - {latest_lux:.2f} lx "
-                              f"(samples: {len(buffer_samples)})")
-                        buffer_samples.clear()
-                    else:
-                        print(f"No samples collected in the last {self.interval} seconds")
-                    last_log_time = current_time
-                time.sleep(0.5)
+                    lux = None
+                if lux is not None:
+                    ts = int(time.time())
+                    iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                    row = [ts, iso, round(lux, 2)]
+                    if self.include_stats:
+                        row.extend([round(lux, 2), round(lux, 2), round(lux, 2), 0.0, 1])
+                    with open(self.csv_path, 'a', newline='') as csvfile:
+                        writer = csv.writer(csvfile)
+                        writer.writerow(row)
+                    print(f"{iso} - {lux:.2f} lx")
+                next_time += self.interval
+                sleep_for = next_time - time.time()
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                else:
+                    next_time = time.time()
             except Exception as e:
-                print(f"Data processing error: {e}", file=sys.stderr)
-                time.sleep(5.0)
-    
+                print(f"Logging loop error: {e}", file=sys.stderr)
+                time.sleep(1.0)
+
     def start(self):
         if self.running:
             return
         self.running = True
-        print(f"Starting light sensor logging every {self.interval} seconds...")
+        print(f"Starting light sensor logging every {self.interval} seconds (readings per interval: {self.readings_per_interval})...")
         print(f"Data file: {self.csv_path}")
         print("Press Ctrl+C to stop")
-        sensor_thread = threading.Thread(target=self._read_sensor_continuous, daemon=True)
-        sensor_thread.start()
-        process_thread = threading.Thread(target=self._process_and_log_data, daemon=True)
-        process_thread.start()
+        worker = threading.Thread(target=self._read_and_log_loop, daemon=True)
+        worker.start()
         try:
             while self.running:
                 time.sleep(1)
         except KeyboardInterrupt:
             self.stop()
-    
+
     def stop(self):
         if not self.running:
             return
@@ -170,29 +151,17 @@ Examples:
   %(prog)s --no-stats               #Disable statistical analysis
   %(prog)s --addr 0x5c --bus 0      #Use different I2C address/bus
         """)
-    parser.add_argument('-f', '--filename', type=str,
-                       help='CSV filename (default: auto-generated with timestamp)')
-    parser.add_argument('--addr', type=lambda x: int(x,0), default=0x23,
-                       help='I2C address (default: 0x23)')
-    parser.add_argument('--bus', type=int, default=1,
-                       help='I2C bus number (default: 1)')
-    parser.add_argument('--buffer-size', type=int, default=100,
-                       help='Internal buffer size (default: 100)')
-    parser.add_argument('--no-stats', action='store_true',
-                       help='Disable statistical analysis')
+    parser.add_argument('-f', '--filename', type=str, help='CSV filename (default: auto-generated with timestamp)')
+    parser.add_argument('--addr', type=lambda x: int(x,0), default=0x23, help='I2C address (default: 0x23)')
+    parser.add_argument('--bus', type=int, default=1, help='I2C bus number (default: 1)')
+    parser.add_argument('--buffer-size', type=int, default=100, help='Internal buffer size (default: 100)')
+    parser.add_argument('--no-stats', action='store_true', help='Disable statistical analysis')
     return parser.parse_args()
 
 def main():
     args = parse_csv_args()
     try:
-        logger = CSVLightLogger(
-            filename=args.filename,
-            interval=logging_interval,
-            bus=args.bus,
-            addr=args.addr,
-            buffer_size=args.buffer_size,
-            include_stats=not args.no_stats
-        )
+        logger = CSVLightLogger(filename=args.filename, interval=logging_interval, bus=args.bus, addr=args.addr, buffer_size=args.buffer_size, include_stats=not args.no_stats)
         logger.start()
     except KeyboardInterrupt:
         print("\nInterrupted by user")
