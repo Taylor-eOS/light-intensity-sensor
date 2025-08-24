@@ -30,10 +30,9 @@ class CSVLightLogger:
             print(f"Failed to initialize BH1750 sensor: {e}", file=sys.stderr)
             sys.exit(2)
         if filename is None:
-            #filename = f"light_data_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-            filename = f"light_data.csv"
+            filename = f"light_data_{datetime.now().strftime('%Y%m%d')}.csv"
         self.csv_path = Path(filename)
-        self.readings_per_interval = max(1, min(5, int(self.interval / 10) + 1))
+        self.readings_per_interval = max(1, min(5, int(self.interval / 8) + 1))
         self.sample_delay = 0.1
         self.max_consecutive_errors = 5
         self._initialize_csv()
@@ -58,47 +57,78 @@ class CSVLightLogger:
     def _calculate_stats(self, values):
         if not values:
             return None, None, None, None
-        mean = statistics.mean(values)
-        stdev = statistics.stdev(values) if len(values) > 1 else 0.0
-        return min(values), max(values), mean, stdev
+        vmin = int(round(min(values)))
+        vmax = int(round(max(values)))
+        median = int(round(statistics.median(values)))
+        stdev = int(round(statistics.stdev(values))) if len(values) > 1 else 0
+        return vmin, vmax, median, stdev
 
     def _aggregate_readings(self, readings):
         if not readings:
             return None
         if len(readings) == 1:
-            return readings[0]
-        sorted_r = sorted(readings)
-        if len(sorted_r) <= 2:
-            return statistics.mean(sorted_r)
-        trimmed = sorted_r[1:-1]
-        return statistics.mean(trimmed)
+            return int(round(readings[0])), [readings[0]]
+        m = statistics.median(readings)
+        devs = [abs(x - m) for x in readings]
+        mad = statistics.median(devs)
+        if mad == 0:
+            threshold = 2.0
+        else:
+            threshold = 3.0 * 1.4826 * mad
+        filtered = [x for x in readings if abs(x - m) <= threshold]
+        if not filtered:
+            filtered = readings
+        rep = int(round(statistics.median(filtered)))
+        return rep, filtered
 
     def _read_and_log_loop(self):
         consecutive_errors = 0
         next_time = time.time()
         while self.running:
             try:
-                try:
-                    lux = self.sensor.read_lux()
-                    consecutive_errors = 0
-                except Exception as e:
-                    consecutive_errors += 1
-                    print(f"Sensor read error ({consecutive_errors}/{self.max_consecutive_errors}): {e}", file=sys.stderr)
-                    if consecutive_errors >= self.max_consecutive_errors:
-                        print("Too many consecutive errors, stopping logger", file=sys.stderr)
-                        self.running = False
-                        break
-                    lux = None
-                if lux is not None:
-                    ts = int(time.time())
-                    iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-                    row = [ts, iso, round(lux, 2)]
-                    if self.include_stats:
-                        row.extend([round(lux, 2), round(lux, 2), round(lux, 2), 0.0, 1])
-                    with open(self.csv_path, 'a', newline='') as csvfile:
-                        writer = csv.writer(csvfile)
-                        writer.writerow(row)
-                    print(f"{iso} - {lux:.2f} lx")
+                samples = []
+                for _ in range(self.readings_per_interval):
+                    try:
+                        lux = self.sensor.read_lux()
+                        samples.append(lux)
+                        consecutive_errors = 0
+                    except Exception as e:
+                        consecutive_errors += 1
+                        print(f"Sensor read error ({consecutive_errors}/{self.max_consecutive_errors}): {e}", file=sys.stderr)
+                        if consecutive_errors >= self.max_consecutive_errors:
+                            print("Too many consecutive errors, stopping logger", file=sys.stderr)
+                            self.running = False
+                            break
+                    if len(samples) < self.readings_per_interval:
+                        time.sleep(self.sample_delay)
+                if not self.running:
+                    break
+                valid = [s for s in samples if s is not None]
+                if valid:
+                    agg = self._aggregate_readings(valid)
+                    if agg is None:
+                        representative = None
+                        filtered = []
+                    elif isinstance(agg, tuple):
+                        representative, filtered = agg
+                    else:
+                        representative = int(round(agg))
+                        filtered = valid
+                    if representative is not None:
+                        ts = int(time.time())
+                        iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                        row = [ts, iso, representative]
+                        if self.include_stats:
+                            stats = self._calculate_stats(filtered)
+                            if stats[0] is None:
+                                row.extend([representative, representative, representative, 0, len(filtered)])
+                            else:
+                                vmin, vmax, vmid, vstdev = stats
+                                row.extend([vmin, vmax, vmid, vstdev, len(filtered)])
+                        with open(self.csv_path, 'a', newline='') as csvfile:
+                            writer = csv.writer(csvfile)
+                            writer.writerow(row)
+                        print(f"{iso} - {representative} lx")
                 next_time += self.interval
                 sleep_for = next_time - time.time()
                 if sleep_for > 0:
